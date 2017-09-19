@@ -1,0 +1,5 @@
+# /vmfs/volumes/datastore1/crontab.local
+30 18 * * 1,3 /vmfs/volumes/datastore1/vmbackup.sh dc2 guidesbn >> /vmfs/volumes/datastore1/vmbackup.log
+30 18 * * 2,4 /vmfs/volumes/datastore1/vmbackup.sh dc1 >> /vmfs/volumes/datastore1/vmbackup.log
+#30 12 * * 6 /vmfs/volumes/datastore1/vmbackup.sh server2vm >> /vmfs/volumes/datastore1/vmbackup.log
+30 0 * * 0 /vmfs/volumes/datastore1/vmbackup.sh edit >> /vmfs/volumes/datastore1/vmbackup.log

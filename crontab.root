@@ -1,0 +1,5 @@
+#min hour day mon dow command
+1    1    *   *   *   /sbin/tmpwatch.py
+1    *    *   *   *   /sbin/auto-backup.sh
+0    *    *   *   *   /usr/lib/vmware/vmksummary/log-heartbeat.py
+*/5  *    *   *   *   /sbin/hostd-probe
