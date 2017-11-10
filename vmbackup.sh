@@ -1,181 +1,127 @@
 #!/bin/sh 
 # File: vmbackup.sh
 # Author: Andrea Giuliano
-# Description: script per la shell di ESXi per la copia integrale di una macchina virtuale
-# La VM viene spenta e tale rimane finche' il suo disco non e' copiato localmente.
-# La copia effettiva viene effettuata subito dopo, con la VM gia' riavviata.
+# Description: ESXi shell script to backup a VM remotely without
+# downtime. It creates a snapshot, copies locally the VM relevant files,
+# including the "frozen" disk files, then remove the snapshot and copies
+# the local copy over the network to a configurable target directory.
 
 # 
-# Alcune funzioni di comodo
+# Sources some functions and settings
 #
 
-# Formatta come hh:mm:ss un tempo in secondi
+cd ${0%/*}
 
-ftime() 
-{ 
-  ptime=$1 
-  ph=$((ptime/3600)) 
-  ptime=$((ptime%3600)) 
-  pm=$((ptime/60)) 
-  ps=$((ptime%60)) 
-  printf "%02d:%02d:%02d" $ph $pm $ps 
-} 
-
-#
-# Data e ora attuali in secondi dall'epoch
-#
-
-now()
-{
-  date +%s 
-}
-
-#
-# Intervallo di tempi in secondi
-#
-
-lap()
-{
-  NEW=$(now)
-  OLD=$1
-  echo $((NEW - OLD)) 
-}
-
-#
-# Log minimale, con id del processo e della VM in elaborazione
-#
-
-log() 
-{ 
-  echo "[$$] $1" 
-} 
-
-#
-# Funzioni per l'output
-#
- 
-drow() 
-{ 
-  log "===================================================" 
-} 
- 
-srow() 
-{ 
-  log "---------------------------------------------------" 
-} 
-
-#
-# Clona localmente il disco virtuale
-#
- 
-clone()
-{
-  awk -F=\  '/vmdk/ {gsub("\"","", $2) ; print $2}' $1/*.vmx \
-  | while read disk ; do
-    log "clonazione $1/$disk su $TEMP/$disk..." 
-    #vmkfstools -i $1/$disk $TEMP/$disk > /dev/null
-    vmkfstools -i $1/$disk $TEMP/$disk
-  done
-}
-
-# 
-# Esegue un comando dopo averlo visualizzato
-#
-
-run() 
-{ 
-  echo "[$$] $1" 
-  eval "$1" 
-} 
-
-#
-# Ricava l'id di una VM a partire dal nome (parola intera, case sensitive)
-#
-
-getId()
-{
-  vim-cmd vmsvc/getallvms | awk -v vm=$1 '$2 == vm {print $1}' 
-}
+. ./vmbackup-func.sh
+. ./vmbackup-conf.sh
 
 # Inizio del programma principale
 
 drow
-log "vmbackup.sh avviato alle $(date +%T) del $(date +%F)"
+log "vmbackup.sh started at $(date +%T) on $(date +%F)"
 drow
 
 if [ -f vmbackup.run ]; then 
   pid=$(cat vmbackup.run) 
-  log "E' gia' in corso il processo $pid, esco subito..." 
+  log "The process $pid is already running, I stop immediately..." 
   exit 
 fi 
  
-log "Creo un lock file per il processo $$..." 
+log "Creating a lock file for process $$..." 
 echo "$$" > vmbackup.run 
 sleep 3 
  
-SOURCE=/vmfs/volumes/datastore1 
-TARGET=/vmfs/volumes/nas869 
-TEMP=/vmfs/volumes/datastore1/temp
+
+# The day of week as a number, to mark different copies.
 DAY="$(date +%u)"
  
-if [ "$1" == "-n" ]; then 
-  PO="$1" 
-  log "Le VM non saranno avviate dopo la copia ($PO)" 
-  shift 
-fi 
 echo 
 srow 
 astart=$(date +%s) 
+
+# Loops on VM names given as parameters. These are not the directories
+# in which the VM files are, though they may be the same.
+
 for vm in "$@" ; do 
-  #vmId=$(vim-cmd vmsvc/getallvms | awk -v vm=$vm '$2 == vm {print $1}') 
   vmId=$(getId "$vm")
+  vmDir=$(getDir "$vm")
   if [ "$vmId" != "" ]; then 
     pstart=$(date +%s) 
-    log "$vm [$vmId] avvio backup alle $(date +%T) del $(date +%F)" 
+    log "$vm [$vmId] backup started at $(date +%T) on $(date +%F)" 
     srow 
-    #log "Backup di $vm [$vmId]..." 
-    if vim-cmd vmsvc/power.getstate $vmId | grep -q "Powered on" ; then 
-      log "$vm [$vmId] shutdown del guest..." 
-      run "vim-cmd vmsvc/power.shutdown $vmId" 
-      run "sleep 120" 
-      run "vim-cmd vmsvc/power.getstate $vmId" 
-    fi
-    log "$vm [$vmId] clonazione dischi virtuali..." 
+    log "Backing up $vm [$vmId]..." 
     run "rm -rf $TEMP"
     run "mkdir $TEMP"
     cstart=$(now)
-    clone "$SOURCE/$vm"
-    log "$vm [$vmId] copia temporanea file non-disco..." 
-    run "cp $SOURCE/$vm/*.vmx $TEMP/"
-    run "cp $SOURCE/$vm/*.vmxf $TEMP/"
-    run "cp $SOURCE/$vm/*.nvram $TEMP/"
-    run "cp $SOURCE/$vm/*.log $TEMP/"
+
+# We need two lists: one of VMDK files and one of the other essential
+# VM files. Logs and swap files are usually not needed. The files of the
+# two lists will be copied at different time: the latter before taking
+# the snapshot, the earlier after.
+
+    CP1=$(ls -1 $vmDir/*.vmx $vmDir/*.vmxf $vmDir/*.nvram $vmDir/*.vmsd 2> /dev/null)
+    CP2=$(ls -1 $vmDir/*.vmdk)
+
+# Non VMDK files are copied before the snapshot, which alters 
+# temporarily some of them.
+
+    log "$vm [$vmId] non-disk files local copy..." 
+    for FF in $CP1 ; do run "cp -a $FF $TEMP/" ; done
+
+# Now we take a snapshot of the powered off VM, so the copy can be 
+# started without warnings about bad shutdown. The snapshot will last
+# just the time needed for copying locally all the big VMDK files.
+
+		dstart=$(now)
+		log "$vm [$vmId] shutting down..."
+		shutdown $vmId
+		waitUntilOff $vmId
+	  log "$vm [$vmId] creating a snapshot..." 
+    vim-cmd vmsvc/snapshot.create $vmId snapshot-$vmId
+		log "$vm [$vmId] powering on..."
+		powerOn $vmId
+		waitUntilOn $vmId
+    dtime=$(lap $dstart)
+    log "$vm [$vmId] has been down for $(ftime $ctime)..." 
+
+# Local copy of the VMDK files. We just wait a few seconds.
+
+		sleep 10
+    log "$vm [$vmId] disk files local copy..." 
+    for FF in $CP2 ; do run "cp -a $FF $TEMP/" ; done
     ctime=$(lap $cstart)
-    log "$vm [$vmId] downtime $(ftime $ctime)..." 
-    if [ "$PO" != "-n" ]; then 
-      run "sleep 120" 
-      log "$vm [$vmId] avvio del guest..." 
-      run "vim-cmd vmsvc/power.on $vmId" 
-    fi 
-    run "vim-cmd vmsvc/power.getstate $vmId" 
-    log "$vm [$vmId] inizio copia effettiva..." 
-    run "rm -rf $TARGET/$vm-$DAY" 
-    #run "cp -a $SOURCE/$vm $TARGET/$vm-$DAY" 
-    run "cp -a $TEMP $TARGET/$vm-$DAY" 
-    run "chmod -R a+r $TARGET/$vm-$DAY"
-    log "$vm [$vmId] copia effettiva terminata..." 
-    #log "$vm [$vmId] rimozione copia temporanea..." 
-    #run "rm -rf $TEMP"
-    pstop=$(date +%s) 
-    ptime=$((pstop - pstart)) 
-    log "$vm [$vmId] tempo parziale: $(ftime $ptime) ($ptime secondi)" 
-    log "$vm [$vmId] finito alle $(date +%T) del $(date +%F)" 
-    srow 
+    log "$vm [$vmId] local copy took $(ftime $ctime)..." 
+    
+# We don't need the snapshot any longer, so we delete it. We assume
+# no other snapshot are needed. If it's not the case, the command below
+# should be modified.
+
+	  log "$vm [$vmId] removing all snapshots..." 
+  	vim-cmd vmsvc/snapshot.removeall $vmId
+  	
+# The remote copy can start immediately: the files to be copied are all
+# frozen and are not affected by the snapshot removal process. The copy
+# is only made if $TARGET is not empty
+
+		if [ $TARGET ]; then 
+	    log "$vm [$vmId] starting remote copy..."
+	    run "rm -rf $TARGET/$vm-$DAY" 
+  	  run "cp -a $TEMP $TARGET/$vm-$DAY" 
+  	  run "chmod -R a+r $TARGET/$vm-$DAY"
+  	  log "$vm [$vmId] remote copy completed..." 
+  	  pstop=$(date +%s) 
+  	  ptime=$((pstop - pstart)) 
+  	  log "$vm [$vmId] lap time: $(ftime $ptime) ($ptime seconds)" 
+  	  log "$vm [$vmId] finished at $(date +%T) on $(date +%F)" 
+  	  srow
+  	 else
+  	 	log "$vm [$vmId] empty target, skipping remote copy..."
+  	 fi 
   fi 
 done 
 pstop=$(date +%s) 
 ptime=$((pstop - astart)) 
-log "Tempo totale: $(ftime $ptime) ($((ptime)) secondi)" 
+log "Total time: $(ftime $ptime) ($((ptime)) seconds)" 
 drow 
-log "Rimuovo il lock file per il processo $$" 
+log "Removing lock file for process $$" 
 run "rm vmbackup.run"
